@@ -37,29 +37,58 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
+    # Order matters: secrets first, then PII. Each match → "[REDACTED]".
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Obfuscated secrets that survive regex (e.g. "a d m i n 1 2 3",
+    # "sk_vinbank_secret_2024") → withhold the whole text.
+    if contains_protected_secret(redacted):
+        issues.append("protected_secret: obfuscated value found")
+        redacted = "[REDACTED]"
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
     }
+
+
+PII_PATTERNS = {
+    # --- Secrets ---
+    "db_host": r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d{2,5})?\b",
+    "api_key": r"\bsk-[A-Za-z0-9_-]{6,}",
+    "password": r"\b(?:password|passwd|pwd|mật\s*khẩu|mat\s*khau)\b\s*(?:is|là|la|:|=)\s*\S+",
+    "known_secret": r"\badmin123\b",
+    # --- PII ---
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+    # VN phone: 0xxxxxxxxx (10) / 0xxxxxxxxxx (11) or +84…; not the 1900 hotline.
+    "phone": r"(?<!\d)(?:\+84|0)\d{9,10}(?!\d)",
+    # CMND 9 digits / CCCD 12 digits
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+}
+
+# Issue types that mean "a protected secret reached the output" — the plugin
+# withholds the whole reply instead of returning a partially redacted one.
+SECRET_ISSUE_TYPES = ("db_host", "api_key", "password", "known_secret", "protected_secret")
+
+
+def _alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def contains_protected_secret(text: str) -> bool:
+    """True if any value from data/protected/vinbank_secrets.json appears,
+    even with punctuation / spacing changed."""
+    from core.config import DEMO_SECRETS
+
+    norm = _alnum(text)
+    return any(_alnum(s) and _alnum(s) in norm for s in DEMO_SECRETS)
 
 
 # ============================================================
@@ -167,21 +196,48 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     ):
         """Check LLM response before sending to user."""
         self.total_count += 1
+        self.last_action = None
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.last_issues = result["issues"]
+            leaked_secret = any(
+                issue.split(":", 1)[0] in SECRET_ISSUE_TYPES for issue in result["issues"]
+            )
+            if leaked_secret:
+                # Secret in the reply → withhold everything (no partial hints).
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                llm_response.content = self._as_content(WITHHELD_MESSAGE)
+                return llm_response
+            # Only customer PII → keep the answer, mask the PII.
+            self.redacted_count += 1
+            self.last_action = "redacted"
+            llm_response.content = self._as_content(result["redacted"])
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                llm_response.content = self._as_content(WITHHELD_MESSAGE)
+
+        return llm_response
+
+    @staticmethod
+    def _as_content(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
+
+
+WITHHELD_MESSAGE = (
+    "I cannot share internal system details. "
+    "I can help with VinBank accounts, transfers, savings, loans and credit cards."
+)
 
 
 # ============================================================
